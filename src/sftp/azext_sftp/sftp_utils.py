@@ -1,0 +1,260 @@
+# --------------------------------------------------------------------------------------------
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License. See License.txt in the project root for license information.
+# --------------------------------------------------------------------------------------------
+import colorama
+import datetime
+import os
+import platform
+import subprocess
+import time
+import signal
+
+from knack import log
+from azure.cli.core import azclierror
+
+from . import constants as const
+
+logger = log.get_logger(__name__)
+
+
+def _build_sftp_command(op_info):
+    """Build the SFTP command with all necessary arguments."""
+    destination = op_info.get_destination()
+    command = [
+        get_ssh_client_path("sftp", op_info.ssh_client_folder),
+        "-o", "PasswordAuthentication=no",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "PubkeyAcceptedKeyTypes=rsa-sha2-256-cert-v01@openssh.com,rsa-sha2-256",
+        "-o", "LogLevel=ERROR"  # Reduce verbose output
+    ]
+    command.extend(op_info.build_args())
+
+    # Add SFTP-specific arguments if provided
+    if op_info.sftp_args:
+        sftp_arg_list = op_info.sftp_args.split(' ') if isinstance(op_info.sftp_args, str) else op_info.sftp_args
+        command.extend(sftp_arg_list)
+
+    command.append(destination)
+    return command
+
+
+def _handle_process_interruption(sftp_process):
+    """Handle keyboard interruption of SFTP process."""
+    logger.info("Connection interrupted by user (KeyboardInterrupt)")
+    if not sftp_process:
+        return
+
+    if platform.system() == "Windows":
+        sftp_process.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        sftp_process.terminate()
+
+    try:
+        sftp_process.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        # Process didn't terminate cleanly or other process-related error
+        pass
+
+
+def _execute_sftp_process(command, env, creationflags, batch_input):
+    """Execute the SFTP process with appropriate input handling."""
+    if batch_input:
+        sftp_process = subprocess.Popen(
+            command, env=env, encoding='utf-8', stdin=subprocess.PIPE, creationflags=creationflags
+        )
+        sftp_process.communicate(input=batch_input)
+        return sftp_process, sftp_process.returncode
+
+    sftp_process = subprocess.Popen(
+        command, env=env, encoding='utf-8', creationflags=creationflags
+    )
+    try:
+        return_code = sftp_process.wait()
+        return sftp_process, return_code
+    except KeyboardInterrupt:
+        _handle_process_interruption(sftp_process)
+        return sftp_process, None
+
+
+def _attempt_connection(command, env, creationflags, op_info, attempt_num):
+    """Attempt a single SFTP connection."""
+    connection_start_time = time.time()
+    try:
+        print(f"Connecting to SFTP server (attempt {attempt_num})...")
+        logger.debug("Running SFTP command: %s", ' '.join(command))
+
+        batch_input = getattr(op_info, 'sftp_batch_commands', None)
+        _, return_code = _execute_sftp_process(command, env, creationflags, batch_input)
+
+        if return_code is None:  # KeyboardInterrupt occurred
+            return False, None, None
+
+        if return_code == 0:
+            connection_duration = time.time() - connection_start_time
+            logger.debug("SFTP connection successful in %.2f seconds", connection_duration)
+            return True, connection_duration, None
+
+        logger.warning("SFTP connection failed with return code: %d", return_code)
+        return False, time.time() - connection_start_time, None
+
+    except OSError as e:
+        connection_duration = time.time() - connection_start_time
+        error_msg = f"Failed to start SFTP connection: {str(e)}"
+        return False, connection_duration, error_msg
+
+
+def start_sftp_connection(op_info):
+    """Start an SFTP connection using the provided session information."""
+    try:
+        env = os.environ.copy()
+        retry_attempts_allowed = 2
+        command = _build_sftp_command(op_info)
+        logger.debug("SFTP command: %s", ' '.join(command))
+
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == "Windows" else 0
+
+        for attempt in range(retry_attempts_allowed + 1):
+            result = _attempt_connection(command, env, creationflags, op_info, attempt + 1)
+            successful, duration, error_msg = result
+
+            if successful:
+                return
+            if duration is None:  # KeyboardInterrupt
+                return
+
+            if error_msg:  # OSError occurred
+                if attempt >= retry_attempts_allowed:
+                    raise azclierror.UnclassifiedUserFault(error_msg, const.RECOMMENDATION_SSH_CLIENT_NOT_FOUND)
+                logger.warning("%s. Retrying...", error_msg)
+
+            # Only log duration if it's not None (not a KeyboardInterrupt)
+            if duration is not None:
+                logger.debug("Connection attempt %d duration: %.2f seconds", attempt + 1, duration)
+            if attempt < retry_attempts_allowed:
+                time.sleep(1)
+
+        raise azclierror.UnclassifiedUserFault(
+            "Failed to establish SFTP connection after multiple attempts.",
+            "Please check your network connection, credentials, and that the SFTP server is accessible."
+        )
+
+    except KeyboardInterrupt:
+        logger.info("SFTP connection interrupted by user (outer handler)")
+        print("\nSFTP session exited cleanly.")
+
+
+def create_ssh_keyfile(private_key_file, ssh_client_folder=None):
+    sshkeygen_path = get_ssh_client_path("ssh-keygen", ssh_client_folder)
+    command = [sshkeygen_path, "-f", private_key_file, "-t", "rsa", "-q", "-N", ""]
+    logger.debug("Running ssh-keygen command %s", ' '.join(command))
+    try:
+        subprocess.call(command)
+    except OSError as e:
+        colorama.init()
+        raise azclierror.BadRequestError(f"Failed to create ssh key file with error: {str(e)}.",
+                                         const.RECOMMENDATION_SSH_CLIENT_NOT_FOUND)
+
+
+def get_certificate_start_and_end_times(cert_file, ssh_client_folder=None):
+    validity_str = _get_ssh_cert_validity(cert_file, ssh_client_folder)
+    times = None
+    if validity_str and "Valid: from " in validity_str and " to " in validity_str:
+        times = validity_str.replace("Valid: from ", "").split(" to ")
+        t0 = datetime.datetime.strptime(times[0], '%Y-%m-%dT%X')
+        t1 = datetime.datetime.strptime(times[1], '%Y-%m-%dT%X')
+        times = (t0, t1)
+    return times
+
+
+def get_ssh_cert_principals(cert_file, ssh_client_folder=None):
+    info = get_ssh_cert_info(cert_file, ssh_client_folder)
+    principals = []
+    in_principal = False
+    for line in info:
+        if ":" in line:
+            in_principal = False
+        if "Principals:" in line:
+            in_principal = True
+            continue
+        if in_principal:
+            principals.append(line.strip())
+
+    return principals
+
+
+# Helpers
+def get_ssh_cert_info(cert_file, ssh_client_folder=None):
+    sshkeygen_path = get_ssh_client_path("ssh-keygen", ssh_client_folder)
+    command = [sshkeygen_path, "-L", "-f", cert_file]
+    logger.debug("Running ssh-keygen command %s", ' '.join(command))
+    try:
+        return subprocess.check_output(command).decode().splitlines()
+    except OSError as e:
+        colorama.init()
+        raise azclierror.BadRequestError(f"Failed to get certificate info with error: {str(e)}.",
+                                         const.RECOMMENDATION_SSH_CLIENT_NOT_FOUND)
+
+
+def _get_ssh_cert_validity(cert_file, ssh_client_folder=None):
+    if cert_file:
+        info = get_ssh_cert_info(cert_file, ssh_client_folder)
+        for line in info:
+            if "Valid:" in line:
+                return line.strip()
+    return None
+
+
+def get_ssh_client_path(ssh_command="ssh", ssh_client_folder=None):
+    if ssh_client_folder:
+        ssh_path = os.path.join(ssh_client_folder, ssh_command)
+        if platform.system() == 'Windows':
+            ssh_path = ssh_path + '.exe'
+        if os.path.isfile(ssh_path):
+            logger.debug("Attempting to run %s from path %s", ssh_command, ssh_path)
+            return ssh_path
+        logger.warning("Could not find %s in provided --ssh-client-folder %s. "
+                       "Attempting to get pre-installed OpenSSH bits.", ssh_command, ssh_client_folder)
+
+    ssh_path = ssh_command
+
+    if platform.system() == 'Windows':
+        # If OS architecture is 64bit and python architecture is 32bit,
+        # look for System32 under SysNative folder.
+        machine = platform.machine()
+        os_architecture = None
+        # python interpreter architecture
+        platform_architecture = platform.architecture()[0]
+        sys_path = None
+
+        if machine.endswith('64'):
+            os_architecture = '64bit'
+        elif machine.endswith('86'):
+            os_architecture = '32bit'
+        elif machine == '':
+            raise azclierror.BadRequestError("Couldn't identify the OS architecture.")
+        else:
+            raise azclierror.BadRequestError(f"Unsuported OS architecture: {machine} is not currently supported")
+
+        if os_architecture == "64bit":
+            sys_path = 'SysNative' if platform_architecture == '32bit' else 'System32'
+        else:
+            sys_path = 'System32'
+
+        system_root = os.environ['SystemRoot']
+        system32_path = os.path.join(system_root, sys_path)
+        ssh_path = os.path.join(system32_path, "openSSH", (ssh_command + ".exe"))
+        logger.debug("Platform architecture: %s", platform_architecture)
+        logger.debug("OS architecture: %s", os_architecture)
+        logger.debug("System Root: %s", system_root)
+        logger.debug("Attempting to run %s from path %s", ssh_command, ssh_path)
+
+        if not os.path.isfile(ssh_path):
+            raise azclierror.UnclassifiedUserFault(
+                "Could not find " + ssh_command + ".exe on path " + ssh_path + ". ",
+                colorama.Fore.YELLOW + "Make sure OpenSSH is installed correctly: "
+                "https://docs.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse . "
+                "Or use --ssh-client-folder to provide folder path with ssh executables. " + colorama.Style.RESET_ALL)
+
+    return ssh_path
